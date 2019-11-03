@@ -56,6 +56,7 @@ func main() {
 		}
 	}
 
+	// this is equivalent to github.WebHookType(r)
 	eventType := os.Getenv("Http_X_Github_Event")
 
 	if err := handleEvent(eventType, requestRaw, config); err != nil {
@@ -65,118 +66,70 @@ func main() {
 }
 
 func handleEvent(eventType string, bytesIn []byte, config config.Config) error {
+	// event will be a specific github activity event
+	event, err := github.ParseWebHook(eventType, bytesIn)
+	if err != nil {
+		return fmt.Errorf("Cannot parse input %s", err.Error())
+	}
+
+	derekConfig, err := getConfig(eventType, event, config)
+	if err != nil {
+		return err
+	}
 
 	switch eventType {
 	case "release":
-		req := github.ReleaseEvent{}
-
-		if err := json.Unmarshal(bytesIn, &req); err != nil {
-			return fmt.Errorf("Cannot parse input %s", err.Error())
+		req, ok := event.(*github.ReleaseEvent)
+		if !ok {
+			return fmt.Errorf("invalid release event")
 		}
-
-		customer, err := auth.IsCustomer(req.Repo.Owner.GetLogin(), &http.Client{})
-		if err != nil {
-			return fmt.Errorf("unable to verify customer: %s/%s", req.Repo.Owner.GetLogin(), req.Repo.GetName())
-		} else if customer == false {
-			return fmt.Errorf("no customer found for: %s/%s", req.Repo.Owner.GetLogin(), req.Repo.GetName())
-		}
-
-		var derekConfig *types.DerekRepoConfig
-		if req.Repo.GetPrivate() {
-			derekConfig, err = handler.GetPrivateRepoConfig(req.Repo.Owner.GetLogin(), req.Repo.GetName(), int(req.Installation.GetID()), config)
-		} else {
-			derekConfig, err = handler.GetRepoConfig(req.Repo.Owner.GetLogin(), req.Repo.GetName())
-		}
-
-		err = fmt.Errorf(`"release_notes" feature not enabled`)
 		if handler.EnabledFeature(releaseNotes, derekConfig) {
-
-			handler := handler.NewReleaseHandler(config, int(req.Installation.GetID()))
-			err = handler.Handle(req)
+			return handler.NewReleaseHandler(config, int(req.Installation.GetID())).Handle(*req)
 		}
-		return err
-
+		return fmt.Errorf(`"release_notes" feature not enabled`)
 	case "pull_request":
+		// TODO: replace with github.PullRequestEvent
 		req := types.PullRequestOuter{}
 		if err := json.Unmarshal(bytesIn, &req); err != nil {
 			return fmt.Errorf("Cannot parse input %s", err.Error())
 		}
 
-		customer, err := auth.IsCustomer(req.Repository.Owner.Login, &http.Client{})
-		if err != nil {
-			return fmt.Errorf("Unable to verify customer: %s/%s", req.Repository.Owner.Login, req.Repository.Name)
-		} else if customer == false {
-			return fmt.Errorf("No customer found for: %s/%s", req.Repository.Owner.Login, req.Repository.Name)
+		if prIsClosed(req) {
+			return nil
 		}
 
-		var derekConfig *types.DerekRepoConfig
-		if req.Repository.Private {
-			derekConfig, err = handler.GetPrivateRepoConfig(req.Repository.Owner.Login, req.Repository.Name, req.Installation.ID, config)
-		} else {
-			derekConfig, err = handler.GetRepoConfig(req.Repository.Owner.Login, req.Repository.Name)
-		}
-		if err != nil {
-			return fmt.Errorf("Unable to access maintainers file at: %s/%s\nError: %s",
-				req.Repository.Owner.Login,
-				req.Repository.Name,
-				err.Error())
-		}
-
-		if req.Action != handler.ClosedConstant && req.PullRequest.State != handler.ClosedConstant {
-			contributingURL := getContributingURL(derekConfig.ContributingURL, req.Repository.Owner.Login, req.Repository.Name)
-			if handler.EnabledFeature(hacktoberfest, derekConfig) {
-				isSpamPR, _ := handler.HandleHacktoberfestPR(req, contributingURL, config)
-				if isSpamPR {
-					return nil
-				}
-			}
-			if handler.EnabledFeature(dcoCheck, derekConfig) {
-				handler.HandlePullRequest(req, contributingURL, config)
-			}
-			if handler.EnabledFeature(prDescriptionRequired, derekConfig) {
-				handler.VerifyPullRequestDescription(req, contributingURL, config)
+		contributingURL := getContributingURL(derekConfig.ContributingURL, req.Repository.Owner.Login, req.Repository.Name)
+		if handler.EnabledFeature(hacktoberfest, derekConfig) {
+			isSpamPR, _ := handler.HandleHacktoberfestPR(req, contributingURL, config)
+			if isSpamPR {
+				return nil
 			}
 		}
-		break
-
+		if handler.EnabledFeature(dcoCheck, derekConfig) {
+			handler.HandlePullRequest(req, contributingURL, config)
+		}
+		if handler.EnabledFeature(prDescriptionRequired, derekConfig) {
+			handler.VerifyPullRequestDescription(req, contributingURL, config)
+		}
+		return nil
 	case "issue_comment":
+		// TODO: replace with github.IssueCommentEvent
 		req := types.IssueCommentOuter{}
 		if err := json.Unmarshal(bytesIn, &req); err != nil {
 			return fmt.Errorf("Cannot parse input %s", err.Error())
 		}
 
-		customer, err := auth.IsCustomer(req.Repository.Owner.Login, &http.Client{})
-		if err != nil {
-			return fmt.Errorf("Unable to verify customer: %s/%s", req.Repository.Owner.Login, req.Repository.Name)
-		} else if customer == false {
-			return fmt.Errorf("No customer found for: %s/%s", req.Repository.Owner.Login, req.Repository.Name)
+		if req.Action == deleted {
+			return nil
 		}
 
-		var derekConfig *types.DerekRepoConfig
-		if req.Repository.Private {
-			derekConfig, err = handler.GetPrivateRepoConfig(req.Repository.Owner.Login, req.Repository.Name, req.Installation.ID, config)
-		} else {
-			derekConfig, err = handler.GetRepoConfig(req.Repository.Owner.Login, req.Repository.Name)
+		if handler.PermittedUserFeature(comments, derekConfig, req.Comment.User.Login) {
+			handler.HandleComment(req, config, derekConfig)
 		}
-
-		if err != nil {
-			return fmt.Errorf("Unable to access maintainers file at: %s/%s\nError: %s",
-				req.Repository.Owner.Login,
-				req.Repository.Name,
-				err.Error())
-		}
-
-		if req.Action != deleted {
-			if handler.PermittedUserFeature(comments, derekConfig, req.Comment.User.Login) {
-				handler.HandleComment(req, config, derekConfig)
-			}
-		}
-		break
+		return nil
 	default:
 		return fmt.Errorf("X_Github_Event want: ['pull_request', 'issue_comment'], got: " + eventType)
 	}
-
-	return nil
 }
 
 func getContributingURL(contributingURL, owner, repositoryName string) string {
@@ -189,4 +142,54 @@ func getContributingURL(contributingURL, owner, repositoryName string) string {
 func hmacValidation() bool {
 	val := os.Getenv("validate_hmac")
 	return (val != "false") && (val != "0")
+}
+
+func prIsClosed(req types.PullRequestOuter) bool {
+	return req.Action == handler.ClosedConstant || req.PullRequest.State == handler.ClosedConstant
+}
+
+type githubActivityEvent interface {
+	GetInstallation() *github.Installation
+	GetRepo() *github.Repository
+}
+
+func getConfig(eventType string, payload interface{}, config config.Config) (repoConfig *types.DerekRepoConfig, err error) {
+	if payload == nil {
+		return nil, fmt.Errorf("Empty payload")
+	}
+
+	event, ok := payload.(githubActivityEvent)
+	if !ok {
+		return nil, fmt.Errorf("Invalid event payload")
+	}
+
+	repo := event.GetRepo()
+	login := repo.Owner.GetLogin()
+	name := repo.GetName()
+
+	isCustomer, err := auth.IsCustomer(login, &http.Client{})
+	if err != nil {
+		return nil, fmt.Errorf("unable to verify customer: %s/%s", login, name)
+	}
+
+	if !isCustomer {
+		return nil, fmt.Errorf("no customer found for: %s/%s", login, name)
+	}
+
+	if repo.GetPrivate() {
+		repoConfig, err = handler.GetPrivateRepoConfig(login, name, int(event.GetInstallation().GetID()), config)
+	} else {
+		repoConfig, err = handler.GetRepoConfig(login, name)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf(
+			"Unable to access maintainers file at: %s/%s\nError: %s",
+			login,
+			name,
+			err.Error(),
+		)
+	}
+
+	return repoConfig, nil
 }
