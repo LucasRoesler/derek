@@ -77,18 +77,13 @@ func handleEvent(eventType string, bytesIn []byte, config config.Config) error {
 		return err
 	}
 
-	switch eventType {
-	case "release":
-		req, ok := event.(*github.ReleaseEvent)
-		if !ok {
-			return fmt.Errorf("invalid release event")
-		}
+	switch r := event.(type) {
+	case *github.ReleaseEvent:
 		if handler.EnabledFeature(releaseNotes, derekConfig) {
-			return handler.NewReleaseHandler(config, int(req.Installation.GetID())).Handle(*req)
+			return handler.NewReleaseHandler(config, int(r.Installation.GetID())).Handle(*r)
 		}
 		return fmt.Errorf(`"release_notes" feature not enabled`)
-	case "pull_request":
-		// TODO: replace with github.PullRequestEvent
+	case *github.PullRequestEvent:
 		req := types.PullRequestOuter{}
 		if err := json.Unmarshal(bytesIn, &req); err != nil {
 			return fmt.Errorf("Cannot parse input %s", err.Error())
@@ -112,8 +107,7 @@ func handleEvent(eventType string, bytesIn []byte, config config.Config) error {
 			handler.VerifyPullRequestDescription(req, contributingURL, config)
 		}
 		return nil
-	case "issue_comment":
-		// TODO: replace with github.IssueCommentEvent
+	case *github.IssueCommentEvent:
 		req := types.IssueCommentOuter{}
 		if err := json.Unmarshal(bytesIn, &req); err != nil {
 			return fmt.Errorf("Cannot parse input %s", err.Error())
